@@ -14,14 +14,18 @@ cp Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 cp Info.plist "$APP/Contents/Info.plist"
 # Sign with the stable local identity when it exists (tools/make_signing_cert.sh), otherwise ad-hoc.
 # A stable identity keeps the Accessibility permission valid across rebuilds; an ad-hoc signature changes every build.
+# --options runtime = hardened runtime: stops DYLD_INSERT_LIBRARIES / library injection into this app, which holds
+# the Accessibility permission.
 SIGN_NAME="DisplayTune Local Signing"
 SIGN_KC="$HOME/Library/Keychains/displaytune-signing.keychain-db"
-if [[ -f "$SIGN_KC" ]]; then
-  security unlock-keychain -p displaytune "$SIGN_KC"
-  codesign --force --sign "$SIGN_NAME" --keychain "$SIGN_KC" "$APP"
+SIGN_PASS_FILE="$HOME/Library/Keychains/displaytune-signing.pass"
+if [[ -f "$SIGN_KC" && -f "$SIGN_PASS_FILE" ]]; then
+  security unlock-keychain -p "$(<"$SIGN_PASS_FILE")" "$SIGN_KC"
+  codesign --force --options runtime --sign "$SIGN_NAME" --keychain "$SIGN_KC" "$APP"
+  security lock-keychain "$SIGN_KC"
 else
-  echo "note: no signing identity found, signing ad-hoc (run tools/make_signing_cert.sh for a stable signature)"
-  codesign --force --sign - "$APP"
+  echo "note: no signing identity set up, signing ad-hoc (run tools/make_signing_cert.sh for a stable signature)"
+  codesign --force --options runtime --sign - "$APP"
 fi
 echo "Built: $PWD/$APP"
 if [[ "${1:-}" == "install" ]]; then
