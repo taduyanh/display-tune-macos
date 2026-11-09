@@ -221,6 +221,9 @@ final class DisplayManager {
     private var known: [String: ManagedDisplay] = [:]
     /// Active flexible-HiDPI sessions, keyed by the physical display's ID.
     var flexible: [CGDirectDisplayID: FlexibleHiDPI] = [:]
+    /// The physical panel's own mode list, captured before a flexible session started. While the panel is mirrored
+    /// onto the virtual display, CoreGraphics reports the virtual display's modes instead.
+    var baseCatalog: [CGDirectDisplayID: ModeCatalog] = [:]
 
     /// Re-enumerate external displays and re-pair them with their DDC channel. Call it when the display configuration
     /// changes — it walks the IORegistry, so it is not meant to run on every menu open.
@@ -284,5 +287,6 @@ final class DisplayManager {
     func stopFlexible(_ physicalID: CGDirectDisplayID) {
         flexible[physicalID]?.stop()
         flexible[physicalID] = nil
+        baseCatalog[physicalID] = nil
     }
 }

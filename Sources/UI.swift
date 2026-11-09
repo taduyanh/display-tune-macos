@@ -147,14 +147,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    private func addSection(for d: ManagedDisplay, catalog cat: ModeCatalog, to menu: NSMenu) {
+    private func addSection(for d: ManagedDisplay, catalog liveCat: ModeCatalog, to menu: NSMenu) {
         menu.addItem(NSMenuItem.sectionHeader(title: d.name))
         let flex = manager.flexible[d.id]
+        // While a flexible session mirrors the panel, the live catalog describes the virtual display: use the panel's own.
+        let cat = (flex != nil ? manager.baseCatalog[d.id] : nil) ?? liveCat
 
         // Current mode line
         let modeText: String
         if let f = flex { modeText = "\(f.width) × \(f.height) HiDPI (flexible, renders \(f.width * 2) × \(f.height * 2))" }
-        else if let m = cat.current { modeText = ModeOption(mode: m).title }
+        else if let m = liveCat.current { modeText = ModeOption(mode: m).title }
         else { modeText = "—" }
         let info = NSMenuItem(title: modeText, action: nil, keyEquivalent: "")
         info.isEnabled = false
@@ -183,12 +185,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // High Resolution (HiDPI) toggle: same "looks like" size, 2x (HiDPI) <-> 1:1
         let hiItem = NSMenuItem(title: "High Resolution (HiDPI)", action: #selector(selectMode(_:)), keyEquivalent: "")
         hiItem.target = self
-        if flex == nil, let cur = cat.current, let other = cat.counterpart() {
+        if flex != nil {
+            // Flexible HiDPI is a HiDPI session: toggling it off returns to the panel's normal mode.
+            hiItem.state = .on
+            hiItem.action = #selector(disableFlexible(_:))
+            hiItem.representedObject = NSNumber(value: d.id)
+        } else if let cur = cat.current, let other = cat.counterpart() {
             hiItem.state = cur.pixelWidth > cur.width ? .on : .off
             hiItem.representedObject = ModeChoice(d.id, other.mode)
         } else {
-            hiItem.state = flex != nil ? .on : .off
-            hiItem.action = nil          // not available (flexible session active or no counterpart mode)
+            hiItem.state = .off
+            hiItem.action = nil          // no counterpart mode
             hiItem.isEnabled = false
         }
         menu.addItem(hiItem)
@@ -204,7 +211,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             resMenu.addItem(mi)
         }
         resItem.submenu = resMenu
-        resItem.isEnabled = flex == nil
         menu.addItem(resItem)
 
         // Refresh rate submenu (only when the current resolution offers several)
@@ -252,6 +258,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func selectMode(_ sender: NSMenuItem) {
         guard let c = sender.representedObject as? ModeChoice else { return }
+        if manager.flexible[c.displayID] != nil {
+            // Leave the flexible session first (un-mirror, drop the virtual display), then apply the panel mode.
+            manager.stopFlexible(c.displayID)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in self?.applyChoice(c) }
+            return
+        }
+        applyChoice(c)
+    }
+
+    private func applyChoice(_ c: ModeChoice) {
         guard showAllModes else {
             if !manager.apply(c.mode, to: c.displayID) { alert("Could not change the resolution.") }
             return
@@ -270,9 +286,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func selectFlexible(_ sender: NSMenuItem) {
         guard let c = sender.representedObject as? FlexChoice,
               let d = manager.displays.first(where: { $0.id == c.displayID }) else { return }
+        let base = manager.baseCatalog[c.displayID] ?? ModeCatalog(c.displayID)   // before mirroring changes what CG reports
         manager.stopFlexible(c.displayID)
         let session = FlexibleHiDPI(physicalID: c.displayID, name: d.name, width: c.w, height: c.h)
         manager.flexible[c.displayID] = session
+        manager.baseCatalog[c.displayID] = base
         session.start { [weak self] error in
             guard let self else { return }
             if let error {
