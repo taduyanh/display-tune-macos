@@ -54,6 +54,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let menu = NSMenu()
     private var brightnessRows: [String: SliderRow] = [:]
     private var refreshWork: DispatchWorkItem?
+    private var wakePending = false
     private let manager = DisplayManager.shared
     private var loginItemEnabled = false
     private var loginItemCheckedAt = Date.distantPast
@@ -71,10 +72,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.delegate = self
         statusItem.menu = menu
         manager.refresh()
+        scheduleRefresh(afterWake: false)     // restores saved Extra HiDPI sessions / arrangement for displays already attached
         BrightnessKeys.shared.start()
         NotificationCenter.default.addObserver(self, selector: #selector(screensChanged),
                                                name: NSApplication.didChangeScreenParametersNotification, object: nil)
-        NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(screensChanged),
+        NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(systemDidWake),
                                                           name: NSWorkspace.didWakeNotification, object: nil)
     }
 
@@ -83,9 +85,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     /// Display configuration changed / woke from sleep: re-enumerate (debounced) and re-apply software dimming.
-    @objc private func screensChanged() {
+    @objc private func screensChanged() { scheduleRefresh(afterWake: false) }
+    @objc private func systemDidWake() { scheduleRefresh(afterWake: true) }
+
+    private func scheduleRefresh(afterWake: Bool) {
         refreshWork?.cancel()
-        let w = DispatchWorkItem { [weak self] in self?.manager.refresh() }
+        wakePending = wakePending || afterWake
+        let w = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.manager.refresh()
+            // Re-create saved Extra HiDPI sessions first, then put the screens back where the user arranged them.
+            self.manager.restoreFlexibleSessions {
+                let wake = self.wakePending; self.wakePending = false
+                self.manager.settleLayout(afterWake: wake)
+            }
+        }
         refreshWork = w
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0, execute: w)
     }
@@ -258,6 +272,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func selectMode(_ sender: NSMenuItem) {
         guard let c = sender.representedObject as? ModeChoice else { return }
+        manager.setSavedFlexible(nil, for: key(of: c.displayID))
         if manager.flexible[c.displayID] != nil {
             // Leave the flexible session first (un-mirror, drop the virtual display), then apply the panel mode.
             manager.stopFlexible(c.displayID)
@@ -287,6 +302,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let c = sender.representedObject as? FlexChoice,
               let d = manager.displays.first(where: { $0.id == c.displayID }) else { return }
         let base = manager.baseCatalog[c.displayID] ?? ModeCatalog(c.displayID)   // before mirroring changes what CG reports
+        manager.setSavedFlexible(nil, for: d.key)     // saved again only once the user confirms
         manager.stopFlexible(c.displayID)
         let session = FlexibleHiDPI(physicalID: c.displayID, name: d.name, width: c.w, height: c.h)
         manager.flexible[c.displayID] = session
@@ -299,12 +315,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 return
             }
             // Like System Settings: revert automatically unless the user confirms.
-            if !self.confirmKeep(seconds: 15, text: "\(c.w) × \(c.h) HiDPI") { self.manager.stopFlexible(c.displayID) }
+            if self.confirmKeep(seconds: 15, text: "\(c.w) × \(c.h) HiDPI") {
+                self.manager.setSavedFlexible((c.w, c.h), for: d.key)   // re-created automatically after a replug
+            } else {
+                self.manager.stopFlexible(c.displayID)
+            }
         }
     }
 
     @objc private func disableFlexible(_ sender: NSMenuItem) {
         guard let n = sender.representedObject as? NSNumber else { return }
+        manager.setSavedFlexible(nil, for: key(of: n.uint32Value))
         manager.stopFlexible(n.uint32Value)
     }
 
@@ -347,6 +368,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     // MARK: Helpers
+
+    private func key(of id: CGDirectDisplayID) -> String { manager.displays.first { $0.id == id }?.key ?? "" }
 
     private func alert(_ text: String) {
         NSApp.activate(ignoringOtherApps: true)

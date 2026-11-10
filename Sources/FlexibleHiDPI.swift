@@ -13,7 +13,7 @@ final class FlexibleHiDPI {
     private var virtualDisplay: CGVirtualDisplay?
     private let queue = DispatchQueue(label: "displaytune.virtualdisplay")
     private var savedOrigin = CGPoint.zero
-    private var mirrored = false        // true only once the mirror configuration was committed
+    private(set) var mirrored = false   // true only once the mirror configuration was committed
 
     var virtualID: CGDirectDisplayID { virtualDisplay?.displayID ?? 0 }
 
@@ -38,7 +38,8 @@ final class FlexibleHiDPI {
         desc.sizeInMillimeters = (mm.width > 0 && mm.height > 0) ? mm : CGSize(width: 600, height: 340)
         desc.vendorID = FlexibleHiDPI.vendorID
         desc.productID = 0xD15A
-        desc.serialNum = physicalID
+        // Stable across replugs (a changing serial makes macOS treat it as a new screen and forget its position).
+        desc.serialNum = FlexibleHiDPI.stableSerial(for: physicalID)
 
         guard let vd = CGVirtualDisplay(descriptor: desc) else { completion("macOS refused to create the virtual display."); return }
         let settings = CGVirtualDisplaySettings()
@@ -54,6 +55,15 @@ final class FlexibleHiDPI {
             if error != nil { self.stop() }
             completion(error)
         }
+    }
+
+    /// FNV-1a hash of the panel's EDID vendor / model / serial: the same monitor always yields the same value.
+    static func stableSerial(for id: CGDirectDisplayID) -> UInt32 {
+        var h: UInt32 = 2166136261
+        for v in [CGDisplayVendorNumber(id), CGDisplayModelNumber(id), CGDisplaySerialNumber(id)] {
+            for shift in stride(from: 0, to: 32, by: 8) { h = (h ^ ((v >> UInt32(shift)) & 0xFF)) &* 16777619 }
+        }
+        return h == 0 ? 1 : h
     }
 
     private func waitForOnline(_ id: CGDirectDisplayID, attemptsLeft: Int, _ done: @escaping (Bool) -> Void) {
@@ -88,6 +98,8 @@ final class FlexibleHiDPI {
         guard virtualDisplay != nil else { return }
         // Only undo what was actually done, and only if the physical display is still there.
         if mirrored && CGDisplayIsOnline(physicalID) != 0 {
+            // The user may have rearranged displays during the session: use the position as it is now.
+            savedOrigin = CGDisplayBounds(physicalID).origin
             var cfg: CGDisplayConfigRef? = nil
             if CGBeginDisplayConfiguration(&cfg) == .success, let c = cfg {
                 CGConfigureDisplayMirrorOfDisplay(c, physicalID, kCGNullDirectDisplay)

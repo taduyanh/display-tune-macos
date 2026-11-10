@@ -224,6 +224,10 @@ final class DisplayManager {
     /// The physical panel's own mode list, captured before a flexible session started. While the panel is mirrored
     /// onto the virtual display, CoreGraphics reports the virtual display's modes instead.
     var baseCatalog: [CGDirectDisplayID: ModeCatalog] = [:]
+    /// Display keys whose saved flexible session failed to start in this process (no endless retries).
+    private var flexFailed = Set<String>()
+    /// Display set (keys) seen at the last layout settle; a change means a display was plugged / unplugged.
+    private var lastLayoutKeys: Set<String>?
 
     /// Re-enumerate external displays and re-pair them with their DDC channel. Call it when the display configuration
     /// changes — it walks the IORegistry, so it is not meant to run on every menu open.
@@ -288,5 +292,108 @@ final class DisplayManager {
         flexible[physicalID]?.stop()
         flexible[physicalID] = nil
         baseCatalog[physicalID] = nil
+    }
+
+    // MARK: Persistence: Extra HiDPI choice and screen arrangement (per display, survives unplug / replug)
+
+    func savedFlexible(for key: String) -> (w: Int, h: Int)? {
+        guard let a = UserDefaults.standard.array(forKey: "flex.\(key)") as? [Int], a.count == 2 else { return nil }
+        return (a[0], a[1])
+    }
+
+    func setSavedFlexible(_ size: (w: Int, h: Int)?, for key: String) {
+        flexFailed.remove(key)
+        if let size { UserDefaults.standard.set([size.w, size.h], forKey: "flex.\(key)") }
+        else { UserDefaults.standard.removeObject(forKey: "flex.\(key)") }
+    }
+
+    /// Re-creates the saved Extra HiDPI session of every display that has one but no live session (e.g. after a replug).
+    /// `done` runs once all sessions have been started (or failed), on the main thread.
+    func restoreFlexibleSessions(done: @escaping () -> Void) {
+        let todo = displays.filter { d in
+            flexible[d.id] == nil && !flexFailed.contains(d.key) && savedFlexible(for: d.key) != nil && CGDisplayIsActive(d.id) != 0
+        }
+        guard !todo.isEmpty else { done(); return }
+        var pending = todo.count
+        for d in todo {
+            let size = savedFlexible(for: d.key)!
+            let id = d.id, key = d.key
+            baseCatalog[id] = ModeCatalog(id)            // before mirroring changes what CoreGraphics reports
+            let session = FlexibleHiDPI(physicalID: id, name: d.name, width: size.w, height: size.h)
+            flexible[id] = session
+            session.start { [weak self] error in
+                if error != nil { self?.stopFlexible(id); self?.flexFailed.insert(key) }
+                pending -= 1
+                if pending == 0 { done() }
+            }
+        }
+    }
+
+    /// Origin of every attached screen by key (external displays by their key, the built-in as "builtin").
+    /// While a display is mirrored onto a flexible virtual display, CoreGraphics reports the mirror set's bounds.
+    private func currentLayout() -> [String: CGPoint]? {
+        // Never record a half-built state (a flexible session that is not mirrored yet, a sleeping display).
+        if flexible.values.contains(where: { !$0.mirrored }) { return nil }
+        var layout: [String: CGPoint] = [:]
+        for d in displays {
+            if CGDisplayIsAsleep(d.id) != 0 { return nil }
+            layout[d.key] = CGDisplayBounds(d.id).origin
+        }
+        var ids = [CGDirectDisplayID](repeating: 0, count: 16)
+        var count: UInt32 = 0
+        CGGetOnlineDisplayList(16, &ids, &count)
+        if let b = ids.prefix(Int(count)).first(where: { CGDisplayIsBuiltin($0) != 0 }) {
+            if CGDisplayIsAsleep(b) != 0 { return nil }
+            layout["builtin"] = CGDisplayBounds(b).origin
+        }
+        return layout
+    }
+
+    private func layoutStoreKey(_ keys: Set<String>) -> String { "layout." + keys.sorted().joined(separator: "|") }
+
+    private func loadLayout(_ storeKey: String) -> [String: CGPoint]? {
+        guard let raw = UserDefaults.standard.dictionary(forKey: storeKey) as? [String: [Double]] else { return nil }
+        return raw.compactMapValues { $0.count == 2 ? CGPoint(x: $0[0], y: $0[1]) : nil }
+    }
+
+    /// Call after the display configuration has settled (debounced). When the set of attached displays changed
+    /// (or after wake) and an arrangement was saved for exactly that set, it is re-applied; otherwise the current
+    /// arrangement is saved, so rearranging in System Settings is picked up too.
+    func settleLayout(afterWake: Bool) {
+        guard let current = currentLayout() else { return }
+        let keys = Set(current.keys)
+        let setChanged = keys != lastLayoutKeys
+        lastLayoutKeys = keys
+        guard keys.count > 1 else { return }
+        let storeKey = layoutStoreKey(keys)
+        if setChanged || afterWake, let saved = loadLayout(storeKey), saved.count == current.count,
+           saved.contains(where: { k, p in current[k].map { abs($0.x - p.x) > 0.5 || abs($0.y - p.y) > 0.5 } ?? true }) {
+            if applyLayout(saved) { return }       // the next settle (triggered by this change) saves it
+        }
+        UserDefaults.standard.set(current.mapValues { [Double($0.x), Double($0.y)] }, forKey: storeKey)
+    }
+
+    @discardableResult
+    private func applyLayout(_ layout: [String: CGPoint]) -> Bool {
+        guard layout.values.contains(where: { $0.x == 0 && $0.y == 0 }) else { return false }   // one screen must be the main one
+        var targets: [(CGDirectDisplayID, CGPoint)] = []
+        var ids = [CGDirectDisplayID](repeating: 0, count: 16)
+        var count: UInt32 = 0
+        CGGetOnlineDisplayList(16, &ids, &count)
+        for (key, origin) in layout {
+            if key == "builtin" {
+                guard let b = ids.prefix(Int(count)).first(where: { CGDisplayIsBuiltin($0) != 0 }) else { return false }
+                targets.append((b, origin))
+            } else {
+                guard let d = displays.first(where: { $0.key == key }) else { return false }
+                // A mirrored panel takes its position from the virtual display it mirrors.
+                targets.append((flexible[d.id]?.virtualID ?? d.id, origin))
+            }
+        }
+        var cfg: CGDisplayConfigRef? = nil
+        guard CGBeginDisplayConfiguration(&cfg) == .success, let c = cfg else { return false }
+        for (id, o) in targets { CGConfigureDisplayOrigin(c, id, Int32(o.x), Int32(o.y)) }
+        // Mirroring is session-only; do not write a mirrored arrangement into the permanent configuration.
+        return CGCompleteDisplayConfiguration(c, flexible.isEmpty ? .permanently : .forSession) == .success
     }
 }
