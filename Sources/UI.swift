@@ -303,6 +303,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
               let d = manager.displays.first(where: { $0.id == c.displayID }) else { return }
         let base = manager.baseCatalog[c.displayID] ?? ModeCatalog(c.displayID)   // before mirroring changes what CG reports
         manager.setSavedFlexible(nil, for: d.key)     // saved again only once the user confirms
+        let layoutBefore = manager.captureLayout()    // macOS repositions screens when the virtual display appears
         manager.stopFlexible(c.displayID)
         let session = FlexibleHiDPI(physicalID: c.displayID, name: d.name, width: c.w, height: c.h)
         manager.flexible[c.displayID] = session
@@ -314,6 +315,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self.alert("Flexible HiDPI failed: \(error)")
                 return
             }
+            self.manager.restoreLayout(layoutBefore)
             // Like System Settings: revert automatically unless the user confirms.
             if self.confirmKeep(seconds: 15, text: "\(c.w) × \(c.h) HiDPI") {
                 self.manager.setSavedFlexible((c.w, c.h), for: d.key)   // re-created automatically after a replug

@@ -373,6 +373,19 @@ final class DisplayManager {
         UserDefaults.standard.set(current.mapValues { [Double($0.x), Double($0.y)] }, forKey: storeKey)
     }
 
+    /// Snapshot of the current arrangement (nil when it cannot be read reliably right now).
+    func captureLayout() -> [String: CGPoint]? {
+        guard let l = currentLayout(), l.count > 1 else { return nil }
+        return l
+    }
+
+    /// Puts the screens back where `layout` says, shortly after a change that made macOS pick its own positions
+    /// (e.g. a new virtual display being mirrored).
+    func restoreLayout(_ layout: [String: CGPoint]?) {
+        guard let layout else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.applyLayout(layout) }
+    }
+
     @discardableResult
     private func applyLayout(_ layout: [String: CGPoint]) -> Bool {
         guard layout.values.contains(where: { $0.x == 0 && $0.y == 0 }) else { return false }   // one screen must be the main one
